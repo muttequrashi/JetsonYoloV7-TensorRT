@@ -7,205 +7,164 @@
 #include "postprocess.h"
 #include <chrono>
 #include <fstream>
+#include <arpa/inet.h>
+#include <unistd.h>
 
 using namespace nvinfer1;
 
 const static int kOutputSize = kMaxNumOutputBbox * sizeof(Detection) / sizeof(float) + 1;
 static Logger gLogger;
 
-void serialize_engine(unsigned int maxBatchSize, std::string& wts_name, std::string& sub_type, std::string& engine_name) {
-  // Create builder
-  IBuilder* builder = createInferBuilder(gLogger);
-  IBuilderConfig* config = builder->createBuilderConfig();
+void receiveImageFromSocket(int clientSocket, cv::Mat &image) {
+    // Receive image size from Python client
+    int imageSize;
+    if (recv(clientSocket, &imageSize, sizeof(imageSize), 0) == -1) {
+        cerr << "Error receiving image size" << endl;
+        return;
+    }
 
-  // Create model to populate the network, then set the outputs and create an engine
-  IHostMemory* serialized_engine = nullptr;
-  if (sub_type == "t") {
-    serialized_engine = build_engine_yolov7_tiny(maxBatchSize, builder, config, DataType::kFLOAT, wts_name);
-  } else if (sub_type == "v7") {
-    serialized_engine = build_engine_yolov7(maxBatchSize, builder, config, DataType::kFLOAT, wts_name);
-  } else if (sub_type == "x") {
-    serialized_engine = build_engine_yolov7x(maxBatchSize, builder, config, DataType::kFLOAT, wts_name);
-  } else if (sub_type == "w6") {
-    serialized_engine = build_engine_yolov7w6(maxBatchSize, builder, config, DataType::kFLOAT, wts_name);
-  } else if (sub_type == "e6") {
-    serialized_engine = build_engine_yolov7e6(maxBatchSize, builder, config, DataType::kFLOAT, wts_name);
-  } else if (sub_type == "d6") {
-    serialized_engine = build_engine_yolov7d6(maxBatchSize, builder, config, DataType::kFLOAT, wts_name);
-  } else if (sub_type == "e6e") {
-    serialized_engine = build_engine_yolov7e6e(maxBatchSize, builder, config, DataType::kFLOAT, wts_name);
-  }
-  assert(serialized_engine != nullptr);
+    // Check for a valid image size
+    if (imageSize <= 0) {
+        cerr << "Invalid image size: " << imageSize << endl;
+        return;
+    }
 
-  std::ofstream p(engine_name, std::ios::binary);
-  if (!p) {
-    std::cerr << "could not open plan output file" << std::endl;
-    assert(false);
-  }
-  p.write(reinterpret_cast<const char*>(serialized_engine->data()), serialized_engine->size());
+    cout << "Received image size: " << imageSize << " bytes" << endl;
 
-  delete builder;
-  delete config;
-  delete serialized_engine;
+    // Receive image data from Python client
+    vector<uchar> buffer(imageSize);
+    int totalReceived = 0;
+
+    while (totalReceived < imageSize) {
+        int received = recv(clientSocket, buffer.data() + totalReceived, imageSize - totalReceived, 0);
+
+        if (received <= 0) {
+            cerr << "Error receiving image data" << endl;
+            return;
+        }
+
+        totalReceived += received;
+    }
+
+    cout << "Successfully received image data" << endl;
+
+    // Decode image
+    image = cv::imdecode(buffer, IMREAD_UNCHANGED);
 }
 
-void deserialize_engine(std::string& engine_name, IRuntime** runtime, ICudaEngine** engine, IExecutionContext** context) {
-  std::ifstream file(engine_name, std::ios::binary);
-  if (!file.good()) {
-    std::cerr << "read " << engine_name << " error!" << std::endl;
-    assert(false);
-  }
-  size_t size = 0;
-  file.seekg(0, file.end);
-  size = file.tellg();
-  file.seekg(0, file.beg);
-  char* serialized_engine = new char[size];
-  assert(serialized_engine);
-  file.read(serialized_engine, size);
-  file.close();
+void sendDetectionsToSocket(int clientSocket, std::vector<std::vector<Detection>> &detections) {
+    // Serialize detections and send over the socket
+    // Assuming you have a function to serialize detections to JSON or another format
+    // Here, I'll assume you have such a function called serializeDetectionsToJson()
+    std::string jsonDetections = serializeDetectionsToJson(detections);
 
-  *runtime = createInferRuntime(gLogger);
-  assert(*runtime);
-  *engine = (*runtime)->deserializeCudaEngine(serialized_engine, size);
-  assert(*engine);
-  *context = (*engine)->createExecutionContext();
-  assert(*context);
-  delete[] serialized_engine;
-}
+    // Send the size of JSON data
+    size_t size = jsonDetections.size();
+    send(clientSocket, &size, sizeof(size_t), 0);
 
-void prepare_buffer(ICudaEngine* engine, float** input_buffer_device, float** output_buffer_device, float** output_buffer_host) {
-  assert(engine->getNbBindings() == 2);
-  // In order to bind the buffers, we need to know the names of the input and output tensors.
-  // Note that indices are guaranteed to be less than IEngine::getNbBindings()
-  const int inputIndex = engine->getBindingIndex(kInputTensorName);
-  const int outputIndex = engine->getBindingIndex(kOutputTensorName);
-  assert(inputIndex == 0);
-  assert(outputIndex == 1);
-  // Create GPU buffers on device
-  CUDA_CHECK(cudaMalloc((void**)input_buffer_device, kBatchSize * 3 * kInputH * kInputW * sizeof(float)));
-  CUDA_CHECK(cudaMalloc((void**)output_buffer_device, kBatchSize * kOutputSize * sizeof(float)));
-
-  *output_buffer_host = new float[kBatchSize * kOutputSize];
-}
-
-void infer(IExecutionContext& context, cudaStream_t& stream, void** buffers, float* output, int batchSize) {
-  // infer on the batch asynchronously, and DMA output back to host
-  context.enqueue(batchSize, buffers, stream, nullptr);
-  CUDA_CHECK(cudaMemcpyAsync(output, buffers[1], batchSize * kOutputSize * sizeof(float), cudaMemcpyDeviceToHost, stream));
-  CUDA_CHECK(cudaStreamSynchronize(stream));
-}
-
-bool parse_args(int argc, char** argv, std::string& wts, std::string& engine, std::string& img_dir, std::string& sub_type) {
-  if (argc < 4) return false;
-  if (std::string(argv[1]) == "-s" && argc == 5) {
-    wts = std::string(argv[2]);
-    engine = std::string(argv[3]);
-    sub_type = std::string(argv[4]);
-  } else if (std::string(argv[1]) == "-d" && argc == 4) {
-    engine = std::string(argv[2]);
-    img_dir = std::string(argv[3]);
-  } else {
-    return false;
-  }
-  return true;
+    // Send JSON data over the socket
+    send(clientSocket, jsonDetections.c_str(), size, 0);
 }
 
 int main(int argc, char** argv) {
-  cudaSetDevice(kGpuId);
+    cudaSetDevice(kGpuId);
 
-  std::string wts_name = "";
-  std::string engine_name = "";
-  std::string img_dir;
-  std::string sub_type = "";
+    std::string engine_name = "";
+    std::string img_dir;
 
-  if (!parse_args(argc, argv, wts_name, engine_name, img_dir, sub_type)) {
-    std::cerr << "Arguments not right!" << std::endl;
-    std::cerr << "./yolov7 -s [.wts] [.engine] [t/v7/x/w6/e6/d6/e6e]  // serialize model to plan file" << std::endl;
-    std::cerr << "./yolov7 -d [.engine] ../samples  // deserialize plan file and run inference" << std::endl;
-    return -1;
-  }
+    if (argc != 3) {
+        std::cerr << "Usage: " << argv[0] << " [.engine] [image_folder]" << std::endl;
+        return -1;
+    } else {
+        engine_name = std::string(argv[1]);
+        img_dir = std::string(argv[2]);
+    }
 
-  // Create a model using the API directly and serialize it to a file
-  if (!wts_name.empty()) {
-    serialize_engine(kBatchSize, wts_name, sub_type, engine_name);
+    // Deserialize the engine from file
+    IRuntime* runtime = nullptr;
+    ICudaEngine* engine = nullptr;
+    IExecutionContext* context = nullptr;
+    deserialize_engine(engine_name, &runtime, &engine, &context);
+    cudaStream_t stream;
+    CUDA_CHECK(cudaStreamCreate(&stream));
+
+    cuda_preprocess_init(kMaxInputImageSize);
+
+    // Prepare cpu and gpu buffers
+    float* device_buffers[2];
+    float* output_buffer_host = nullptr;
+    prepare_buffer(engine, &device_buffers[0], &device_buffers[1], &output_buffer_host);
+
+    // Create socket
+    int serverSocket = socket(AF_INET, SOCK_STREAM, 0);
+    if (serverSocket == -1) {
+        cerr << "Error creating socket" << endl;
+        return -1;
+    }
+
+    // Bind socket to port
+    sockaddr_in serverAddr;
+    serverAddr.sin_family = AF_INET;
+    serverAddr.sin_port = htons(12345);  // Choose a port number
+    serverAddr.sin_addr.s_addr = INADDR_ANY;
+
+    if (bind(serverSocket, (struct sockaddr*)&serverAddr, sizeof(serverAddr)) == -1) {
+        cerr << "Error binding socket" << endl;
+        close(serverSocket);
+        return -1;
+    }
+
+    // Listen for incoming connections
+    if (listen(serverSocket, 1) == -1) {
+        cerr << "Error listening for connections" << endl;
+        close(serverSocket);
+        return -1;
+    }
+
+    cout << "Waiting for connections..." << endl;
+
+    while (1) {
+        // Accept a client connection
+        int clientSocket = accept(serverSocket, NULL, NULL);
+        if (clientSocket == -1) {
+            cerr << "Error accepting connection" << endl;
+            close(serverSocket);
+            return -1;
+        }
+
+        cout << "Client connected" << endl;
+
+        // Receive image from the client and perform inference
+        cv::Mat frame;
+        receiveImageFromSocket(clientSocket, frame);
+
+        // Preprocess
+        cuda_preprocess(frame, device_buffers[0], kInputW, kInputH, stream);
+
+        // Run inference
+        infer(*context, stream, (void**)device_buffers, output_buffer_host, 1);
+
+        // NMS
+        std::vector<std::vector<Detection>> res_batch;
+        batch_nms(res_batch, output_buffer_host, 1, kOutputSize, kConfThresh, kNmsThresh);
+
+        // Send detections back to the client
+        sendDetectionsToSocket(clientSocket, res_batch);
+
+        // Close client socket
+        close(clientSocket);
+    }
+
+    // Cleanup
+    close(serverSocket);
+    cudaStreamDestroy(stream);
+    CUDA_CHECK(cudaFree(device_buffers[0]));
+    CUDA_CHECK(cudaFree(device_buffers[1]));
+    delete[] output_buffer_host;
+    cuda_preprocess_destroy();
+    delete context;
+    delete engine;
+    delete runtime;
+
     return 0;
-  }
-
-  // Deserialize the engine from file
-  IRuntime* runtime = nullptr;
-  ICudaEngine* engine = nullptr;
-  IExecutionContext* context = nullptr;
-  deserialize_engine(engine_name, &runtime, &engine, &context);
-  cudaStream_t stream;
-  CUDA_CHECK(cudaStreamCreate(&stream));
-
-  cuda_preprocess_init(kMaxInputImageSize);
-
-  // Prepare cpu and gpu buffers
-  float* device_buffers[2];
-  float* output_buffer_host = nullptr;
-  prepare_buffer(engine, &device_buffers[0], &device_buffers[1], &output_buffer_host);
-
-  // Read images from directory
-  std::vector<std::string> file_names;
-  if (read_files_in_dir(img_dir.c_str(), file_names) < 0) {
-    std::cerr << "read_files_in_dir failed." << std::endl;
-    return -1;
-  }
-
-  // batch predict
-  for (size_t i = 0; i < file_names.size(); i += kBatchSize) {
-    // Get a batch of images
-    std::vector<cv::Mat> img_batch;
-    std::vector<std::string> img_name_batch;
-    for (size_t j = i; j < i + kBatchSize && j < file_names.size(); j++) {
-      cv::Mat img = cv::imread(img_dir + "/" + file_names[j]);
-      img_batch.push_back(img);
-      img_name_batch.push_back(file_names[j]);
-    }
-
-    // Preprocess
-    cuda_batch_preprocess(img_batch, device_buffers[0], kInputW, kInputH, stream);
-
-    // Run inference
-    auto start = std::chrono::system_clock::now();
-    infer(*context, stream, (void**)device_buffers, output_buffer_host, kBatchSize);
-    auto end = std::chrono::system_clock::now();
-    std::cout << "inference time: " << std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count() << "ms" << std::endl;
-
-    // NMS
-    std::vector<std::vector<Detection>> res_batch;
-    batch_nms(res_batch, output_buffer_host, img_batch.size(), kOutputSize, kConfThresh, kNmsThresh);
-
-    // Draw bounding boxes
-    draw_bbox(img_batch, res_batch);
-
-    // Save images
-    for (size_t j = 0; j < img_batch.size(); j++) {
-      cv::imwrite("_" + img_name_batch[j], img_batch[j]);
-    }
-  }
-
-  // Release stream and buffers
-  cudaStreamDestroy(stream);
-  CUDA_CHECK(cudaFree(device_buffers[0]));
-  CUDA_CHECK(cudaFree(device_buffers[1]));
-  delete[] output_buffer_host;
-  cuda_preprocess_destroy();
-  // Destroy the engine
-  delete context;
-  delete engine;
-  delete runtime;
-
-  // Print histogram of the output distribution
-  //std::cout << "\nOutput:\n\n";
-  //for (unsigned int i = 0; i < kOutputSize; i++)
-  //{
-  //    std::cout << prob[i] << ", ";
-  //    if (i % 10 == 0) std::cout << std::endl;
-  //}
-  //std::cout << std::endl;
-
-  return 0;
 }
-
